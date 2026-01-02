@@ -1,7 +1,11 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Ensure the bundled SQLite seed DB is included in the serverless function.
+  // Without this, Vercel/Next output tracing may omit quizgo.db.
+  outputFileTracingIncludes: {
+    'app/api/database/route': ['quizgo.db'],
+  },
 };
 
 export default nextConfig;

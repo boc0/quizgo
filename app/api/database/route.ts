@@ -1,5 +1,7 @@
 import Database from 'better-sqlite3';
 import { NextRequest, NextResponse } from 'next/server';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 export const runtime = 'nodejs';
@@ -45,16 +47,41 @@ type SubmissionRow = {
   answers_json: string;
 };
 
-const DB_PATH =
-  process.env.SQLITE_DB_PATH ||
-  path.join(process.cwd(), 'quizgo.db');
+const BUNDLED_DB_PATH = path.join(process.cwd(), 'quizgo.db');
+
+function getRuntimeDbPath() {
+  // If explicitly set, trust it (useful for local dev or self-hosting).
+  if (process.env.SQLITE_DB_PATH) return process.env.SQLITE_DB_PATH;
+
+  // Vercel's deployment filesystem is read-only; only /tmp is writable.
+  if (process.env.VERCEL) return path.join(os.tmpdir(), 'quizgo.db');
+
+  // Default local behavior: use the repo/root file.
+  return BUNDLED_DB_PATH;
+}
+
+function ensureSeededDb(runtimeDbPath: string) {
+  // Only seed when we are *not* already using the bundled file.
+  if (runtimeDbPath === BUNDLED_DB_PATH) return;
+
+  // If the runtime DB already exists, do nothing.
+  if (fs.existsSync(runtimeDbPath)) return;
+
+  // Seed from bundled DB if it exists; otherwise SQLite will create a new file.
+  if (fs.existsSync(BUNDLED_DB_PATH)) {
+    fs.copyFileSync(BUNDLED_DB_PATH, runtimeDbPath);
+  }
+}
 
 let dbSingleton: Database.Database | null = null;
 
 function getDb(): Database.Database {
   if (dbSingleton) return dbSingleton;
 
-  const db = new Database(DB_PATH);
+  const runtimeDbPath = getRuntimeDbPath();
+  ensureSeededDb(runtimeDbPath);
+
+  const db = new Database(runtimeDbPath);
   // Basic durability for local dev.
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
