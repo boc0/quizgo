@@ -1,10 +1,9 @@
-import Database from 'better-sqlite3';
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import { list, put, head, BlobNotFoundError } from '@vercel/blob';
+import { createHash } from 'crypto';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 type QuizRuleset = 'multiple-choice' | 'number' | 'free-text' | string;
 
@@ -33,88 +32,97 @@ export type SubmissionPayload = {
   answers: Array<{ number: number; answer: string | number }>;
 };
 
-type QuizRow = {
+type StoredQuiz = {
   id: string;
-  title: string | null;
-  data_json: string;
+  title?: string;
+  rounds: QuizRound[];
+  teams: string[];
+  updatedAt: string;
 };
 
-type SubmissionRow = {
+type StoredSubmission = {
   id: string;
-  quiz_id: string;
-  team_name: string;
-  round_number: number;
-  answers_json: string;
+  quizId: string;
+  teamName: string;
+  roundNumber: number;
+  answers: SubmissionPayload['answers'];
+  updatedAt: string;
 };
 
-const BUNDLED_DB_PATH = path.join(process.cwd(), 'quizgo.db');
+const STORE_PREFIX = process.env.QUIZGO_BLOB_PREFIX?.trim() || 'quizgo-db';
+const QUIZZES_PREFIX = `${STORE_PREFIX}/quizzes/`;
+const SUBMISSIONS_PREFIX = `${STORE_PREFIX}/submissions/`;
+const MIN_CACHE_SECONDS = 60;
 
-function getRuntimeDbPath() {
-  // If explicitly set, trust it (useful for local dev or self-hosting).
-  if (process.env.SQLITE_DB_PATH) return process.env.SQLITE_DB_PATH;
-
-  // Vercel's deployment filesystem is read-only; only /tmp is writable.
-  if (process.env.VERCEL) return path.join(os.tmpdir(), 'quizgo.db');
-
-  // Default local behavior: use the repo/root file.
-  return BUNDLED_DB_PATH;
-}
-
-function ensureSeededDb(runtimeDbPath: string) {
-  // Only seed when we are *not* already using the bundled file.
-  if (runtimeDbPath === BUNDLED_DB_PATH) return;
-
-  // If the runtime DB already exists, do nothing.
-  if (fs.existsSync(runtimeDbPath)) return;
-
-  // Seed from bundled DB if it exists; otherwise SQLite will create a new file.
-  if (fs.existsSync(BUNDLED_DB_PATH)) {
-    fs.copyFileSync(BUNDLED_DB_PATH, runtimeDbPath);
+function requireBlobToken() {
+  // When using the Vercel Blob integration, this env var should exist in production.
+  // (The SDK defaults to process.env.BLOB_READ_WRITE_TOKEN when deployed on Vercel.)
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    throw new Error(
+      'Missing BLOB_READ_WRITE_TOKEN. Add Vercel Blob to the project and ensure the read-write token is present in the deployment environment.',
+    );
   }
 }
 
-let dbSingleton: Database.Database | null = null;
+function encodePathSegment(value: string) {
+  return encodeURIComponent(value.trim());
+}
 
-function getDb(): Database.Database {
-  if (dbSingleton) return dbSingleton;
+function quizPathname(id: string) {
+  return `${QUIZZES_PREFIX}${encodePathSegment(id)}.json`;
+}
 
-  const runtimeDbPath = getRuntimeDbPath();
-  ensureSeededDb(runtimeDbPath);
+function submissionPathname(quizId: string, teamName: string, roundNumber: number) {
+  return `${SUBMISSIONS_PREFIX}${encodePathSegment(quizId)}/${encodePathSegment(teamName)}/${roundNumber}.json`;
+}
 
-  const db = new Database(runtimeDbPath);
-  // Basic durability for local dev.
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+function stableSubmissionId(quizId: string, teamName: string, roundNumber: number) {
+  const hash = createHash('sha256')
+    .update(`${quizId}\n${teamName}\n${roundNumber}`)
+    .digest('hex')
+    .slice(0, 16);
+  return `sub_${hash}`;
+}
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS quizzes (
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      data_json TEXT NOT NULL
+async function readJsonBlob<T>(pathname: string): Promise<T | null> {
+  try {
+    requireBlobToken();
+    const meta = await head(pathname);
+    const res = await fetch(meta.url, { method: 'GET' });
+    if (!res.ok) {
+      throw new Error(`Failed to fetch blob content for ${pathname} (HTTP ${res.status})`);
+    }
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof BlobNotFoundError) return null;
+    throw err;
+  }
+}
+
+async function listAllBlobs(prefix: string) {
+  requireBlobToken();
+  const blobs: Array<{ pathname: string; url: string; uploadedAt: Date }> = [];
+  let cursor: string | undefined;
+  // Simple pagination loop (limit is 1000 by default).
+  for (;;) {
+    const page = await list({ prefix, cursor });
+    blobs.push(
+      ...page.blobs.map((b) => ({ pathname: b.pathname, url: b.url, uploadedAt: b.uploadedAt })),
     );
-
-    CREATE TABLE IF NOT EXISTS submissions (
-      id TEXT PRIMARY KEY,
-      quiz_id TEXT NOT NULL,
-      team_name TEXT NOT NULL,
-      round_number INTEGER NOT NULL,
-      answers_json TEXT NOT NULL,
-      FOREIGN KEY (quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS submissions_unique
-      ON submissions (quiz_id, team_name, round_number);
-
-    CREATE INDEX IF NOT EXISTS submissions_by_quiz
-      ON submissions (quiz_id);
-  `);
-
-  dbSingleton = db;
-  return db;
+    if (!page.hasMore) break;
+    cursor = page.cursor;
+  }
+  return blobs;
 }
 
 function jsonResponse(body: unknown, status = 200) {
-  return NextResponse.json(body, { status });
+  return NextResponse.json(body, {
+    status,
+    headers: {
+      // Avoid accidental caching of API responses.
+      'cache-control': 'no-store',
+    },
+  });
 }
 
 function badRequest(message: string, details?: unknown) {
@@ -136,7 +144,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export async function GET(req: NextRequest) {
-  const db = getDb();
   const { searchParams } = new URL(req.url);
 
   const resource = searchParams.get('resource');
@@ -147,41 +154,62 @@ export async function GET(req: NextRequest) {
   }
 
   if (resource === 'quizzes') {
-    const rows = db
-      .prepare(
-        `SELECT id, title, data_json
-         FROM quizzes`,
-      )
-      .all() as QuizRow[];
+    try {
+      const blobs = await listAllBlobs(QUIZZES_PREFIX);
+      // Read each quiz JSON; tolerate missing/corrupt entries by surfacing an error.
+      const quizzes = await Promise.all(
+        blobs.map(async (b) => {
+          const res = await fetch(b.url, { method: 'GET' });
+          if (!res.ok) {
+            throw new Error(`Failed to fetch quiz blob ${b.pathname} (HTTP ${res.status})`);
+          }
+          return (await res.json()) as StoredQuiz;
+        }),
+      );
 
-    return jsonResponse(
-      rows.map((r) => ({
-        id: r.id,
-        title: r.title ?? undefined,
-        data: JSON.parse(r.data_json) as unknown,
-      })),
-    );
+      // Most recent first.
+      quizzes.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+
+      return jsonResponse(
+        quizzes.map((q) => ({
+          id: q.id,
+          title: q.title,
+          data: {
+            rounds: q.rounds,
+            teams: q.teams,
+          },
+        })),
+      );
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to list quizzes' },
+        500,
+      );
+    }
   }
 
   if (resource === 'quiz') {
     const id = searchParams.get('id');
     if (!id) return badRequest("Missing 'id' for resource=quiz");
 
-    const row = db
-      .prepare(
-        `SELECT id, title, data_json
-         FROM quizzes
-         WHERE id = ?`,
-      )
-      .get(id) as QuizRow | undefined;
+    try {
+      const quiz = await readJsonBlob<StoredQuiz>(quizPathname(id));
+      if (!quiz) return jsonResponse({ error: 'Quiz not found' }, 404);
 
-    if (!row) return jsonResponse({ error: 'Quiz not found' }, 404);
-
-    return jsonResponse({
-      id: row.id,
-      title: row.title ?? undefined,
-      data: JSON.parse(row.data_json) as unknown,
-    });
+      return jsonResponse({
+        id: quiz.id,
+        title: quiz.title,
+        data: {
+          rounds: quiz.rounds,
+          teams: quiz.teams,
+        },
+      });
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to load quiz' },
+        500,
+      );
+    }
   }
 
   if (resource === 'submissions') {
@@ -189,43 +217,48 @@ export async function GET(req: NextRequest) {
     const teamName = searchParams.get('teamName');
     const roundNumber = parseIntParam(searchParams.get('roundNumber'));
 
-    // Build the simplest safe query based on provided filters.
-    const clauses: string[] = [];
-    const params: unknown[] = [];
+    try {
+      let prefix = SUBMISSIONS_PREFIX;
+      if (quizId) prefix = `${SUBMISSIONS_PREFIX}${encodePathSegment(quizId)}/`;
+      if (quizId && teamName) {
+        prefix = `${SUBMISSIONS_PREFIX}${encodePathSegment(quizId)}/${encodePathSegment(teamName)}/`;
+      }
 
-    if (quizId) {
-      clauses.push('quiz_id = ?');
-      params.push(quizId);
+      const blobs = await listAllBlobs(prefix);
+      const submissions = await Promise.all(
+        blobs.map(async (b) => {
+          const res = await fetch(b.url, { method: 'GET' });
+          if (!res.ok) {
+            throw new Error(`Failed to fetch submission blob ${b.pathname} (HTTP ${res.status})`);
+          }
+          return (await res.json()) as StoredSubmission;
+        }),
+      );
+
+      const filtered = submissions.filter((s) => {
+        if (quizId && s.quizId !== quizId) return false;
+        if (teamName && s.teamName !== teamName) return false;
+        if (roundNumber != null && s.roundNumber !== roundNumber) return false;
+        return true;
+      });
+
+      filtered.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
+
+      return jsonResponse(
+        filtered.map((s) => ({
+          id: s.id,
+          quizId: s.quizId,
+          teamName: s.teamName,
+          roundNumber: s.roundNumber,
+          answers: s.answers,
+        })),
+      );
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to list submissions' },
+        500,
+      );
     }
-    if (teamName) {
-      clauses.push('team_name = ?');
-      params.push(teamName);
-    }
-    if (roundNumber != null) {
-      clauses.push('round_number = ?');
-      params.push(roundNumber);
-    }
-
-    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-
-    const rows = db
-      .prepare(
-        `SELECT id, quiz_id, team_name, round_number, answers_json
-         FROM submissions
-         ${whereSql}
-         ORDER BY rowid DESC`,
-      )
-      .all(...params) as SubmissionRow[];
-
-    return jsonResponse(
-      rows.map((r) => ({
-        id: r.id,
-        quizId: r.quiz_id,
-        teamName: r.team_name,
-        roundNumber: r.round_number,
-        answers: JSON.parse(r.answers_json) as SubmissionPayload['answers'],
-      })),
-    );
   }
 
   if (resource === 'submission') {
@@ -239,31 +272,31 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const row = db
-      .prepare(
-        `SELECT id, quiz_id, team_name, round_number, answers_json
-         FROM submissions
-         WHERE quiz_id = ? AND team_name = ? AND round_number = ?`,
-      )
-      .get(quizId, teamName, roundNumber) as SubmissionRow | undefined;
+    try {
+      const submission = await readJsonBlob<StoredSubmission>(
+        submissionPathname(quizId, teamName, roundNumber),
+      );
+      if (!submission) return jsonResponse({ error: 'Submission not found' }, 404);
 
-    if (!row) return jsonResponse({ error: 'Submission not found' }, 404);
-
-    return jsonResponse({
-      id: row.id,
-      quizId: row.quiz_id,
-      teamName: row.team_name,
-      roundNumber: row.round_number,
-      answers: JSON.parse(row.answers_json) as SubmissionPayload['answers'],
-    });
+      return jsonResponse({
+        id: submission.id,
+        quizId: submission.quizId,
+        teamName: submission.teamName,
+        roundNumber: submission.roundNumber,
+        answers: submission.answers,
+      });
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to load submission' },
+        500,
+      );
+    }
   }
 
   return badRequest(`Unknown resource: ${resource}`);
 }
 
 export async function POST(req: NextRequest) {
-  const db = getDb();
-
   let body: unknown;
   try {
     body = await req.json();
@@ -292,22 +325,32 @@ export async function POST(req: NextRequest) {
     };
 
     const id = typeof quiz.id === 'string' && quiz.id.trim() ? quiz.id.trim() : makeId('quiz');
-    const title = typeof quiz.title === 'string' ? quiz.title : null;
 
-    const dataJson = JSON.stringify({
+    const stored: StoredQuiz = {
+      id,
+      title: typeof quiz.title === 'string' ? quiz.title : undefined,
       rounds: quiz.rounds,
       teams: quiz.teams ?? [],
-    });
+      updatedAt: new Date().toISOString(),
+    };
 
-    db.prepare(
-      `INSERT INTO quizzes (id, title, data_json)
-       VALUES (?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         title = excluded.title,
-         data_json = excluded.data_json`,
-    ).run(id, title, dataJson);
+    try {
+      requireBlobToken();
+      await put(quizPathname(id), JSON.stringify(stored), {
+        access: 'public',
+        contentType: 'application/json',
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        cacheControlMaxAge: MIN_CACHE_SECONDS,
+      });
 
-    return jsonResponse({ id }, 201);
+      return jsonResponse({ id }, 201);
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to save quiz' },
+        500,
+      );
+    }
   }
 
   if (action === 'upsertSubmission') {
@@ -345,24 +388,34 @@ export async function POST(req: NextRequest) {
     const teamName = submission.teamName.trim();
     const roundNumber = Math.trunc(submission.roundNumber);
 
-    const existing = db
-      .prepare(
-        `SELECT id FROM submissions
-         WHERE quiz_id = ? AND team_name = ? AND round_number = ?`,
-      )
-      .get(quizId, teamName, roundNumber) as { id: string } | undefined;
+    const id = stableSubmissionId(quizId, teamName, roundNumber);
 
-    const id = existing?.id ?? makeId('sub');
-    const answersJson = JSON.stringify(submission.answers);
+    const stored: StoredSubmission = {
+      id,
+      quizId,
+      teamName,
+      roundNumber,
+      answers: submission.answers,
+      updatedAt: new Date().toISOString(),
+    };
 
-    db.prepare(
-      `INSERT INTO submissions (id, quiz_id, team_name, round_number, answers_json)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(quiz_id, team_name, round_number) DO UPDATE SET
-         answers_json = excluded.answers_json`,
-    ).run(id, quizId, teamName, roundNumber, answersJson);
+    try {
+      requireBlobToken();
+      await put(submissionPathname(quizId, teamName, roundNumber), JSON.stringify(stored), {
+        access: 'public',
+        contentType: 'application/json',
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        cacheControlMaxAge: MIN_CACHE_SECONDS,
+      });
 
-    return jsonResponse({ id }, 201);
+      return jsonResponse({ id }, 201);
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to save submission' },
+        500,
+      );
+    }
   }
 
   return badRequest(
