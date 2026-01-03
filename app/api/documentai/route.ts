@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { GoogleAuth } from 'google-auth-library';
 
 export const runtime = 'nodejs';
 
@@ -6,14 +7,46 @@ export async function POST(req: NextRequest) {
   const LOCATION = process.env.LOCATION;
   const PROJECT_ID = process.env.PROJECT_ID;
   const PROCESSOR_ID = process.env.PROCESSOR_ID;
-  const GCLOUD_TOKEN = process.env.GCLOUD_TOKEN;
+  const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-  if (!LOCATION || !PROJECT_ID || !PROCESSOR_ID || !GCLOUD_TOKEN) {
+  if (!LOCATION || !PROJECT_ID || !PROCESSOR_ID || !GOOGLE_SERVICE_ACCOUNT_JSON) {
     return NextResponse.json(
       {
         error:
-          'Missing one or more required env vars: LOCATION, PROJECT_ID, PROCESSOR_ID, GCLOUD_TOKEN',
+          'Missing one or more required env vars: LOCATION, PROJECT_ID, PROCESSOR_ID, GOOGLE_SERVICE_ACCOUNT_JSON',
       },
+      { status: 500 },
+    );
+  }
+
+  let serviceAccountCredentials: unknown;
+  try {
+    serviceAccountCredentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+  } catch {
+    return NextResponse.json(
+      {
+        error:
+          'Invalid GOOGLE_SERVICE_ACCOUNT_JSON (expected valid JSON string).',
+      },
+      { status: 500 },
+    );
+  }
+
+  const auth = new GoogleAuth({
+    credentials: serviceAccountCredentials as Record<string, unknown>,
+    scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+  });
+
+  const client = await auth.getClient();
+  const accessTokenResp = await client.getAccessToken();
+  const accessToken =
+    typeof accessTokenResp === 'string'
+      ? accessTokenResp
+      : accessTokenResp?.token;
+
+  if (!accessToken) {
+    return NextResponse.json(
+      { error: 'Failed to obtain Google access token.' },
       { status: 500 },
     );
   }
@@ -61,7 +94,7 @@ export async function POST(req: NextRequest) {
   const upstreamRes = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${GCLOUD_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
