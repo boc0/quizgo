@@ -1379,8 +1379,8 @@ export default function HomeClient() {
                 </div>
               ) : null}
 
-              <div className={submitPdfUrl ? 'mt-6 flex gap-6' : 'mt-6'}>
-                <div className={submitPdfUrl ? 'w-full max-w-md space-y-4' : 'space-y-3'}>
+              <div className="mt-6 space-y-6">
+                <div className={submitPdfUrl ? 'w-full space-y-4' : 'w-full space-y-3'}>
                   <div className="space-y-2">
                     <label className="block text-sm font-medium text-gray-700">Image</label>
                     <input
@@ -1540,8 +1540,8 @@ export default function HomeClient() {
                 </div>
 
                 {submitPdfUrl ? (
-                  <div className="flex-1">
-                    <div className="h-[70vh] overflow-hidden rounded-md border border-gray-200 bg-white">
+                  <div className="w-full">
+                    <div className="h-[60vh] overflow-hidden rounded-md border border-gray-200 bg-white md:h-[70vh]">
                       <iframe title="ScanKit PDF" src={submitPdfUrl} className="h-full w-full" />
                     </div>
                   </div>
