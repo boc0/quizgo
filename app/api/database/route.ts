@@ -115,6 +115,17 @@ async function listAllBlobs(prefix: string) {
   return blobs;
 }
 
+async function writeJsonBlob(pathname: string, value: unknown) {
+  requireBlobToken();
+  await put(pathname, JSON.stringify(value), {
+    access: 'public',
+    contentType: 'application/json',
+    addRandomSuffix: false,
+    allowOverwrite: true,
+    cacheControlMaxAge: MIN_CACHE_SECONDS,
+  });
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return NextResponse.json(body, {
     status,
@@ -420,5 +431,109 @@ export async function POST(req: NextRequest) {
 
   return badRequest(
     "Unknown action. Use action=upsertQuiz or action=upsertSubmission in JSON body.",
+  );
+}
+
+export async function DELETE(req: NextRequest) {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return badRequest('Expected application/json body');
+  }
+
+  const action = isRecord(body) && typeof body.action === 'string' ? body.action : null;
+
+  if (action === 'deleteRound') {
+    const quizIdRaw = isRecord(body) ? body.quizId : undefined;
+    const roundNumberRaw = isRecord(body) ? body.roundNumber : undefined;
+
+    if (typeof quizIdRaw !== 'string' || !quizIdRaw.trim()) {
+      return badRequest('quizId is required');
+    }
+    if (typeof roundNumberRaw !== 'number' || !Number.isFinite(roundNumberRaw)) {
+      return badRequest('roundNumber must be a number');
+    }
+
+    const quizId = quizIdRaw.trim();
+    const roundNumber = Math.trunc(roundNumberRaw);
+
+    try {
+      const quiz = await readJsonBlob<StoredQuiz>(quizPathname(quizId));
+      if (!quiz) return jsonResponse({ error: 'Quiz not found' }, 404);
+
+      const before = quiz.rounds.length;
+      const nextRounds = quiz.rounds.filter((r) => r.roundNumber !== roundNumber);
+      const removed = nextRounds.length !== before;
+
+      const stored: StoredQuiz = {
+        ...quiz,
+        rounds: nextRounds,
+        updatedAt: new Date().toISOString(),
+      };
+
+      await writeJsonBlob(quizPathname(quizId), stored);
+
+      return jsonResponse({ ok: true, removed }, 200);
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to delete round' },
+        500,
+      );
+    }
+  }
+
+  if (action === 'deleteAnswer' || action === 'deleteQuestion') {
+    // "Answer" here refers to a question entry within a round (the thing teams answer).
+    const quizIdRaw = isRecord(body) ? body.quizId : undefined;
+    const roundNumberRaw = isRecord(body) ? body.roundNumber : undefined;
+    const questionNumberRaw = isRecord(body) ? body.questionNumber : undefined;
+
+    if (typeof quizIdRaw !== 'string' || !quizIdRaw.trim()) {
+      return badRequest('quizId is required');
+    }
+    if (typeof roundNumberRaw !== 'number' || !Number.isFinite(roundNumberRaw)) {
+      return badRequest('roundNumber must be a number');
+    }
+    if (typeof questionNumberRaw !== 'number' || !Number.isFinite(questionNumberRaw)) {
+      return badRequest('questionNumber must be a number');
+    }
+
+    const quizId = quizIdRaw.trim();
+    const roundNumber = Math.trunc(roundNumberRaw);
+    const questionNumber = Math.trunc(questionNumberRaw);
+
+    try {
+      const quiz = await readJsonBlob<StoredQuiz>(quizPathname(quizId));
+      if (!quiz) return jsonResponse({ error: 'Quiz not found' }, 404);
+
+      let removed = false;
+      const nextRounds = quiz.rounds.map((r) => {
+        if (r.roundNumber !== roundNumber) return r;
+        const before = r.questions.length;
+        const nextQuestions = r.questions.filter((q) => q.number !== questionNumber);
+        if (nextQuestions.length !== before) removed = true;
+        return { ...r, questions: nextQuestions };
+      });
+
+      const stored: StoredQuiz = {
+        ...quiz,
+        rounds: nextRounds,
+        updatedAt: new Date().toISOString(),
+      };
+
+      await writeJsonBlob(quizPathname(quizId), stored);
+
+      return jsonResponse({ ok: true, removed }, 200);
+    } catch (err) {
+      return jsonResponse(
+        { error: err instanceof Error ? err.message : 'Failed to delete answer' },
+        500,
+      );
+    }
+  }
+
+  return badRequest(
+    "Unknown action. Use action=deleteRound or action=deleteAnswer (aka deleteQuestion) in JSON body.",
   );
 }

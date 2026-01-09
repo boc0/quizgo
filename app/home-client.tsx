@@ -1,7 +1,18 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type HTMLAttributes, type ReactNode } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import {
+  DndContext,
+  PointerSensor,
+  TouchSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 
 type Ruleset = 'multiple-choice' | 'number' | 'free-text';
 
@@ -57,6 +68,40 @@ function isChoice(value: unknown): value is 'A' | 'B' | 'C' | 'D' {
   return value === 'A' || value === 'B' || value === 'C' || value === 'D';
 }
 
+function SortableRow(props: {
+  id: string;
+  disabled?: boolean;
+  children: (args: {
+    attributes: HTMLAttributes<HTMLElement>;
+    listeners: HTMLAttributes<HTMLElement>;
+    isDragging: boolean;
+  }) => ReactNode;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: props.id,
+    disabled: Boolean(props.disabled),
+  });
+
+  const style: CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={isDragging ? 'opacity-60' : undefined}
+    >
+      {props.children({
+        attributes: attributes as unknown as HTMLAttributes<HTMLElement>,
+        listeners: (listeners ?? {}) as unknown as HTMLAttributes<HTMLElement>,
+        isDragging,
+      })}
+    </div>
+  );
+}
+
 export default function HomeClient() {
   const pathname = usePathname();
   const router = useRouter();
@@ -87,6 +132,8 @@ export default function HomeClient() {
 
   const [submitPdfUrl, setSubmitPdfUrl] = useState<string | null>(null);
   const submitPdfUrlRef = useRef<string | null>(null);
+  const submitPdfBlobRef = useRef<Blob | null>(null);
+  const submitPdfSourceKeyRef = useRef<string | null>(null);
   const [submitAnswerDrafts, setSubmitAnswerDrafts] = useState<string[]>([]);
   const [submitSelectedQuizId, setSubmitSelectedQuizId] = useState<string>('');
   const [submitQuiz, setSubmitQuiz] = useState<Quiz | null>(null);
@@ -97,6 +144,11 @@ export default function HomeClient() {
   const [scoreQuiz, setScoreQuiz] = useState<Quiz | null>(null);
   const [scoreScope, setScoreScope] = useState<RoundScope>('all');
   const [scoreResults, setScoreResults] = useState<Array<{ teamName: string; points: number }>>([]);
+
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 5 } }),
+  );
 
   useEffect(() => {
     return () => {
@@ -397,6 +449,20 @@ export default function HomeClient() {
       submitPdfUrlRef.current = null;
     }
     setSubmitPdfUrl(null);
+
+    submitPdfBlobRef.current = null;
+    submitPdfSourceKeyRef.current = null;
+  };
+
+  const clearSubmitPdfResult = () => {
+    setSubmitAnswerDrafts([]);
+    if (submitPdfUrlRef.current) {
+      URL.revokeObjectURL(submitPdfUrlRef.current);
+      submitPdfUrlRef.current = null;
+    }
+    setSubmitPdfUrl(null);
+    submitPdfBlobRef.current = null;
+    submitPdfSourceKeyRef.current = null;
   };
 
   const fetchQuiz = async (id: string): Promise<Quiz> => {
@@ -472,6 +538,32 @@ export default function HomeClient() {
       return data as { id: string };
     } catch (e) {
       setDbError(e instanceof Error ? e.message : 'Failed to save quiz.');
+      throw e;
+    } finally {
+      setIsDbBusy(false);
+    }
+  };
+
+  const deleteFromDb = async (payload: Record<string, unknown>) => {
+    setIsDbBusy(true);
+    setDbError(null);
+    try {
+      const res = await fetch('/api/database', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = typeof data?.error === 'string' ? data.error : 'Delete failed.';
+        throw new Error(msg);
+      }
+      if ((activeTab === 'manage' && manageView === 'quizList') || (activeTab === 'teams' && teamsView === 'quizList')) {
+        await fetchQuizList();
+      }
+      return data as { ok: boolean; removed?: boolean };
+    } catch (e) {
+      setDbError(e instanceof Error ? e.message : 'Delete failed.');
       throw e;
     } finally {
       setIsDbBusy(false);
@@ -561,6 +653,20 @@ export default function HomeClient() {
     setActiveQuestionNumber(null);
     setQuestionDraft(null);
     setManageView('round');
+  };
+
+  const deleteRound = async (roundNumber: number) => {
+    if (!activeQuiz) return;
+    const ok = window.confirm(`Delete round ${roundNumber}? This cannot be undone.`);
+    if (!ok) return;
+
+    await deleteFromDb({ action: 'deleteRound', quizId: activeQuiz.id, roundNumber });
+
+    const updated: Quiz = {
+      ...activeQuiz,
+      rounds: activeQuiz.rounds.filter((r) => r.roundNumber !== roundNumber),
+    };
+    setActiveQuiz(updated);
   };
 
   const setRoundRuleset = async (ruleset: Ruleset) => {
@@ -655,6 +761,75 @@ export default function HomeClient() {
       correctChoice: '',
     });
     setManageView('question');
+  };
+
+  const deleteQuestion = async (questionNumber: number) => {
+    if (!activeQuiz || activeRoundNumber == null) return;
+    const ok = window.confirm(`Delete question ${questionNumber}? This cannot be undone.`);
+    if (!ok) return;
+
+    await deleteFromDb({
+      action: 'deleteAnswer',
+      quizId: activeQuiz.id,
+      roundNumber: activeRoundNumber,
+      questionNumber,
+    });
+
+    const updated: Quiz = {
+      ...activeQuiz,
+      rounds: activeQuiz.rounds.map((r) =>
+        r.roundNumber === activeRoundNumber
+          ? { ...r, questions: r.questions.filter((q) => q.number !== questionNumber) }
+          : r,
+      ),
+    };
+    setActiveQuiz(updated);
+  };
+
+  const reorderRounds = async (event: DragEndEvent) => {
+    if (!activeQuiz) return;
+    if (!event.over) return;
+
+    const activeId = String(event.active.id);
+    const overId = String(event.over.id);
+    if (activeId === overId) return;
+
+    const rounds = activeQuiz.rounds;
+    const oldIndex = rounds.findIndex((r) => `round-${r.roundNumber}` === activeId);
+    const newIndex = rounds.findIndex((r) => `round-${r.roundNumber}` === overId);
+    if (oldIndex < 0 || newIndex < 0) return;
+
+    const nextRounds = arrayMove(rounds, oldIndex, newIndex);
+    const updated: Quiz = { ...activeQuiz, rounds: nextRounds };
+    setActiveQuiz(updated);
+    await saveQuizToDb(updated);
+  };
+
+  const reorderQuestions = async (event: DragEndEvent) => {
+    if (!activeQuiz || activeRoundNumber == null) return;
+    const round = getRound();
+    if (!round) return;
+    if (!event.over) return;
+
+    const activeId = String(event.active.id);
+    const overId = String(event.over.id);
+    if (activeId === overId) return;
+
+    const questions = round.questions;
+    const oldIndex = questions.findIndex((q) => `question-${q.number}` === activeId);
+    const newIndex = questions.findIndex((q) => `question-${q.number}` === overId);
+    if (oldIndex < 0 || newIndex < 0) return;
+
+    const nextQuestions = arrayMove(questions, oldIndex, newIndex);
+    const updated: Quiz = {
+      ...activeQuiz,
+      rounds: activeQuiz.rounds.map((r) =>
+        r.roundNumber === activeRoundNumber ? { ...r, questions: nextQuestions } : r,
+      ),
+    };
+
+    setActiveQuiz(updated);
+    await saveQuizToDb(updated);
   };
 
   const openQuestion = (questionNumber: number) => {
@@ -796,62 +971,85 @@ export default function HomeClient() {
   const submitToScanKit = async () => {
     if (!selectedFile) return;
 
+    const sourceKey = `${selectedFile.name}:${selectedFile.size}:${selectedFile.lastModified}`;
+
     setIsSubmitting(true);
     try {
-      const resizedFile = await resizeHalf(selectedFile);
+      let pdfBlob = submitPdfBlobRef.current;
 
-      const form = new FormData();
-      form.append('file', resizedFile);
-      form.append('return_pdf', 'true');
+      // If we've already got the ScanKit PDF for this exact source file,
+      // reuse it instead of calling ScanKit again (avoids burning credits).
+      if (!(pdfBlob && submitPdfSourceKeyRef.current === sourceKey)) {
+        const resizedFile = await resizeHalf(selectedFile);
 
-      const res = await fetch('/api/scankit', {
-        method: 'POST',
-        body: form,
-      });
+        const form = new FormData();
+        form.append('file', resizedFile);
+        form.append('return_pdf', 'true');
 
-      const contentType = res.headers.get('content-type') ?? '';
-
-      if (contentType.includes('application/pdf')) {
-        const buffer = await res.arrayBuffer();
-
-        const pdfBlob = new Blob([buffer], { type: 'application/pdf' });
-        const url = URL.createObjectURL(pdfBlob);
-        if (submitPdfUrlRef.current) {
-          URL.revokeObjectURL(submitPdfUrlRef.current);
-        }
-        submitPdfUrlRef.current = url;
-        setSubmitPdfUrl(url);
-
-        const docForm = new FormData();
-        docForm.append('file', new File([pdfBlob], 'scankit-result.pdf', { type: 'application/pdf' }));
-
-        const docRes = await fetch('/api/documentai', {
+        const res = await fetch('/api/scankit', {
           method: 'POST',
-          body: docForm,
+          body: form,
         });
 
-        const docJson = (await docRes.json().catch(() => null)) as unknown;
-        if (!docRes.ok) {
-          const msg =
-            isRecord(docJson) && typeof docJson.error === 'string'
-              ? docJson.error
-              : 'Document AI request failed.';
-          throw new Error(msg);
-        }
+        const contentType = res.headers.get('content-type') ?? '';
 
-        const parsed = parseDocumentAiAnswers(docJson);
-        const drafts = Array.from({ length: 10 }, () => '');
-        for (const a of parsed) {
-          if (a.number >= 1 && a.number <= 10) {
-            drafts[a.number - 1] = a.text;
+        if (contentType.includes('application/pdf')) {
+          const buffer = await res.arrayBuffer();
+          pdfBlob = new Blob([buffer], { type: 'application/pdf' });
+
+          submitPdfBlobRef.current = pdfBlob;
+          submitPdfSourceKeyRef.current = sourceKey;
+
+          const url = URL.createObjectURL(pdfBlob);
+          if (submitPdfUrlRef.current) {
+            URL.revokeObjectURL(submitPdfUrlRef.current);
           }
+          submitPdfUrlRef.current = url;
+          setSubmitPdfUrl(url);
+        } else if (contentType.includes('application/json')) {
+          console.log('ScanKit response body:', await res.json());
+          throw new Error('ScanKit did not return a PDF.');
+        } else {
+          console.log('ScanKit response body:', await res.text());
+          throw new Error('ScanKit did not return a PDF.');
         }
-        setSubmitAnswerDrafts(drafts);
-      } else if (contentType.includes('application/json')) {
-        console.log('ScanKit response body:', await res.json());
-      } else {
-        console.log('ScanKit response body:', await res.text());
+      } else if (!submitPdfUrlRef.current) {
+        // Cache hit but the object URL was cleared; recreate it.
+        const url = URL.createObjectURL(pdfBlob);
+        submitPdfUrlRef.current = url;
+        setSubmitPdfUrl(url);
       }
+
+      if (!pdfBlob) {
+        throw new Error('Missing ScanKit PDF result.');
+      }
+
+      const docForm = new FormData();
+      docForm.append('file', new File([pdfBlob], 'scankit-result.pdf', { type: 'application/pdf' }));
+
+      const docRes = await fetch('/api/documentai', {
+        method: 'POST',
+        body: docForm,
+      });
+
+      const docJson = (await docRes.json().catch(() => null)) as unknown;
+      console.log('Document AI response body:', docJson);
+      if (!docRes.ok) {
+        const msg =
+          isRecord(docJson) && typeof docJson.error === 'string'
+            ? docJson.error
+            : 'Document AI request failed.';
+        throw new Error(msg);
+      }
+
+      const parsed = parseDocumentAiAnswers(docJson);
+      const drafts = Array.from({ length: 10 }, () => '');
+      for (const a of parsed) {
+        if (a.number >= 1 && a.number <= 10) {
+          drafts[a.number - 1] = a.text;
+        }
+      }
+      setSubmitAnswerDrafts(drafts);
     } catch (error) {
       setDbError(error instanceof Error ? error.message : 'ScanKit request failed.');
     } finally {
@@ -982,7 +1180,23 @@ export default function HomeClient() {
                       key={selectedFile ? selectedFile.name : 'empty'}
                       type="file"
                       accept="image/*"
-                      onChange={(e) => setSelectedFile(e.target.files?.[0] ?? null)}
+                      onChange={(e) => {
+                        const next = e.target.files?.[0] ?? null;
+                        const prevKey = selectedFile
+                          ? `${selectedFile.name}:${selectedFile.size}:${selectedFile.lastModified}`
+                          : null;
+                        const nextKey = next ? `${next.name}:${next.size}:${next.lastModified}` : null;
+
+                        if (prevKey && nextKey && prevKey !== nextKey) {
+                          clearSubmitPdfResult();
+                        }
+
+                        if (!next) {
+                          clearSubmitPdfResult();
+                        }
+
+                        setSelectedFile(next);
+                      }}
                       className="block w-full text-sm text-gray-600 file:mr-4 file:rounded-md file:border-0 file:bg-gray-100 file:px-3 file:py-2 file:text-sm file:font-medium hover:file:bg-gray-200"
                     />
                     <div className="text-xs text-gray-500">{selectedLabel}</div>
@@ -1214,21 +1428,47 @@ export default function HomeClient() {
                   </div>
 
                   <div className="mt-6 space-y-3">
-                    {activeQuiz.rounds
-                      .slice()
-                      .sort((a, b) => a.roundNumber - b.roundNumber)
-                      .map((r) => (
-                        <button
-                          key={r.roundNumber}
-                          type="button"
-                          onClick={() => openRound(r.roundNumber)}
-                          className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50"
-                          disabled={isDbBusy}
-                        >
-                          <div className="text-sm font-medium text-gray-900">Round {r.roundNumber}</div>
-                          <div className="mt-1 text-xs text-gray-500">{r.questions.length} questions  · {r.ruleset}</div>
-                        </button>
-                      ))}
+                    <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={(e) => void reorderRounds(e)}>
+                      <SortableContext
+                        items={activeQuiz.rounds.map((r) => `round-${r.roundNumber}`)}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {activeQuiz.rounds.map((r) => (
+                          <SortableRow key={r.roundNumber} id={`round-${r.roundNumber}`} disabled={isDbBusy}>
+                            {({ attributes, listeners }) => (
+                              <div className="flex items-stretch gap-2">
+                                <button
+                                  type="button"
+                                  {...attributes}
+                                  {...listeners}
+                                  className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 cursor-grab active:cursor-grabbing"
+                                  disabled={isDbBusy}
+                                >
+                                  Drag
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => openRound(r.roundNumber)}
+                                  className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50"
+                                  disabled={isDbBusy}
+                                >
+                                  <div className="text-sm font-medium text-gray-900">Round {r.roundNumber}</div>
+                                  <div className="mt-1 text-xs text-gray-500">{r.questions.length} questions  · {r.ruleset}</div>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void deleteRound(r.roundNumber)}
+                                  className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                  disabled={isDbBusy}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            )}
+                          </SortableRow>
+                        ))}
+                      </SortableContext>
+                    </DndContext>
 
                     <button
                       type="button"
@@ -1316,21 +1556,47 @@ export default function HomeClient() {
                   )}
 
                   <div className="mt-6 space-y-3">
-                    {(getRound()?.questions ?? [])
-                      .slice()
-                      .sort((a, b) => a.number - b.number)
-                      .map((q) => (
-                        <button
-                          key={q.number}
-                          type="button"
-                          onClick={() => openQuestion(q.number)}
-                          className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50"
-                          disabled={isDbBusy}
-                        >
-                          <div className="text-sm font-medium text-gray-900">Question {q.number}</div>
-                          <div className="mt-1 text-xs text-gray-500">{(q.text ?? '').trim() || '(empty)'}</div>
-                        </button>
-                      ))}
+                    <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={(e) => void reorderQuestions(e)}>
+                      <SortableContext
+                        items={(getRound()?.questions ?? []).map((q) => `question-${q.number}`)}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {(getRound()?.questions ?? []).map((q) => (
+                          <SortableRow key={q.number} id={`question-${q.number}`} disabled={isDbBusy}>
+                            {({ attributes, listeners }) => (
+                              <div className="flex items-stretch gap-2">
+                                <button
+                                  type="button"
+                                  {...attributes}
+                                  {...listeners}
+                                  className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 cursor-grab active:cursor-grabbing"
+                                  disabled={isDbBusy}
+                                >
+                                  Drag
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => openQuestion(q.number)}
+                                  className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50"
+                                  disabled={isDbBusy}
+                                >
+                                  <div className="text-sm font-medium text-gray-900">Question {q.number}</div>
+                                  <div className="mt-1 text-xs text-gray-500">{(q.text ?? '').trim() || '(empty)'}</div>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void deleteQuestion(q.number)}
+                                  className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                  disabled={isDbBusy}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            )}
+                          </SortableRow>
+                        ))}
+                      </SortableContext>
+                    </DndContext>
 
                     <button
                       type="button"
