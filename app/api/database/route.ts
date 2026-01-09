@@ -8,9 +8,11 @@ export const dynamic = 'force-dynamic';
 type QuizRuleset = 'multiple-choice' | 'number' | 'free-text' | string;
 
 type QuizRound = {
+  uid?: string;
   roundNumber: number;
   ruleset: QuizRuleset;
   questions: Array<{
+    uid?: string;
     number: number;
     text: string;
     options?: string[];

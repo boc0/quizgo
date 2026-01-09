@@ -70,6 +70,29 @@ function isChoice(value: unknown): value is 'A' | 'B' | 'C' | 'D' {
   return value === 'A' || value === 'B' || value === 'C' || value === 'D';
 }
 
+function normalizeChoiceLetter(value: unknown): 'A' | 'B' | 'C' | 'D' | '' {
+  if (typeof value !== 'string') return '';
+  const raw = value.trim();
+  if (!raw) return '';
+
+  // Accept Latin A/B/C/D (any casing), and Bulgarian Cyrillic а/б/в/г.
+  const mapChar = (ch: string): 'A' | 'B' | 'C' | 'D' | '' => {
+    if (ch === 'A' || ch === 'a' || ch === 'А' || ch === 'а') return 'A';
+    if (ch === 'B' || ch === 'b' || ch === 'Б' || ch === 'б') return 'B';
+    // Bulgarian 'в' corresponds to Latin 'C'
+    if (ch === 'C' || ch === 'c' || ch === 'В' || ch === 'в') return 'C';
+    if (ch === 'D' || ch === 'd' || ch === 'Г' || ch === 'г') return 'D';
+    return '';
+  };
+
+  if (raw.length === 1) return mapChar(raw);
+  for (const ch of raw) {
+    const mapped = mapChar(ch);
+    if (mapped) return mapped;
+  }
+  return '';
+}
+
 function makeLocalId(prefix: string) {
   // Prefer cryptographically-strong ids when available.
   try {
@@ -140,6 +163,8 @@ export default function HomeClient() {
   } | null>(null);
   const [isDbBusy, setIsDbBusy] = useState(false);
   const [dbError, setDbError] = useState<string | null>(null);
+  const [bulkRoundText, setBulkRoundText] = useState<string>('');
+  const [isBulkCreating, setIsBulkCreating] = useState(false);
 
   const [teamsView, setTeamsView] = useState<TeamsView>('quizList');
   const [teamsQuiz, setTeamsQuiz] = useState<Quiz | null>(null);
@@ -342,8 +367,9 @@ export default function HomeClient() {
         const ans = entry?.answer;
 
         if (round.ruleset === 'multiple-choice') {
-          const correct = typeof q.correctAnswer === 'string' ? q.correctAnswer : '';
-          if (typeof ans === 'string' && ans === correct) {
+          const correct = normalizeChoiceLetter(q.correctAnswer);
+          const given = normalizeChoiceLetter(ans);
+          if (correct && given && given === correct) {
             pointsByTeam.set(s.teamName, (pointsByTeam.get(s.teamName) ?? 0) + pointsPerCorrect);
           }
           continue;
@@ -745,6 +771,118 @@ export default function HomeClient() {
     await saveQuizToDb(updated);
   };
 
+  const bulkCreateQuestionsFromText = async () => {
+    if (!activeQuiz || activeRoundNumber == null) return;
+    const round = getRound();
+    if (!round) return;
+
+    const raw = bulkRoundText.trim();
+    if (!raw) return;
+
+    if ((round.questions?.length ?? 0) > 0) {
+      const ok = window.confirm('Replace existing questions in this round with the parsed ones?');
+      if (!ok) return;
+    }
+
+    setIsBulkCreating(true);
+    setDbError(null);
+    try {
+      const res = await fetch('/api/vertex', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'parseRoundQuestions',
+          ruleset: round.ruleset,
+          text: raw,
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok) {
+        const msg = isRecord(data) && typeof data.error === 'string' ? data.error : 'Failed to parse questions.';
+        throw new Error(msg);
+      }
+
+      const questionsRaw = isRecord(data) && Array.isArray(data.questions) ? (data.questions as unknown[]) : [];
+      if (questionsRaw.length === 0) throw new Error('No questions returned by Vertex.');
+
+      const nextQuestions = questionsRaw
+        .map((q, idx) => {
+          if (!isRecord(q)) return null;
+          const text = typeof q.text === 'string' ? q.text : '';
+          const options = Array.isArray(q.options)
+            ? q.options.filter((v): v is string => typeof v === 'string')
+            : undefined;
+          const correctAnswerRaw = (q as Record<string, unknown>).correctAnswer;
+
+          const base = {
+            uid: makeLocalId('question'),
+            number: idx + 1,
+            text,
+          };
+
+          if (round.ruleset === 'multiple-choice') {
+            const correctChoice = (() => {
+              if (isChoice(correctAnswerRaw)) return correctAnswerRaw;
+              const s = typeof correctAnswerRaw === 'string' ? correctAnswerRaw : '';
+              return normalizeChoiceLetter(s);
+            })();
+            return {
+              ...base,
+              options: (() => {
+                const out = Array.isArray(options) ? options.slice(0, 4) : [];
+                while (out.length < 4) out.push('');
+                return out;
+              })(),
+              correctAnswer: correctChoice,
+            };
+          }
+
+          if (round.ruleset === 'free-text') {
+            const correct: FreeTextCorrectAnswer = (() => {
+              if (isRecord(correctAnswerRaw)) {
+                const bg = typeof correctAnswerRaw.bg === 'string' ? correctAnswerRaw.bg : '';
+                const en = typeof correctAnswerRaw.en === 'string' ? correctAnswerRaw.en : '';
+                if (bg || en) return { bg, en };
+              }
+              const s = typeof correctAnswerRaw === 'string' ? correctAnswerRaw : '';
+              return { bg: s, en: s };
+            })();
+            return {
+              ...base,
+              correctAnswer: correct,
+            };
+          }
+
+          const correctNumber = (() => {
+            const n = typeof correctAnswerRaw === 'number' ? correctAnswerRaw : Number(correctAnswerRaw);
+            return Number.isFinite(n) ? n : 0;
+          })();
+          return {
+            ...base,
+            correctAnswer: correctNumber,
+          };
+        })
+        .filter((v): v is NonNullable<typeof v> => Boolean(v));
+
+      const updated: Quiz = {
+        ...activeQuiz,
+        rounds: activeQuiz.rounds.map((r) =>
+          r.roundNumber === activeRoundNumber ? { ...r, questions: nextQuestions } : r,
+        ),
+      };
+
+      setActiveQuiz(updated);
+      setActiveQuestionNumber(null);
+      setQuestionDraft(null);
+      await saveQuizToDb(updated);
+      setBulkRoundText('');
+    } catch (e) {
+      setDbError(e instanceof Error ? e.message : 'Failed to create questions.');
+    } finally {
+      setIsBulkCreating(false);
+    }
+  };
+
   const addNewQuestion = async () => {
     const round = getRound();
     if (!activeQuiz || !round) return;
@@ -1143,6 +1281,8 @@ export default function HomeClient() {
               const n = Number(raw);
               return Number.isFinite(n) ? n : 0;
             })()
+          : ruleset === 'multiple-choice'
+            ? normalizeChoiceLetter(raw) || raw
           : raw;
 
       return { number, answer };
@@ -1614,6 +1754,26 @@ export default function HomeClient() {
                       />
                     </div>
                   )}
+
+                  <div className="mt-6 space-y-2">
+                    <label className="block text-sm font-medium text-gray-700">Paste full round questions</label>
+                    <textarea
+                      value={bulkRoundText}
+                      onChange={(e) => setBulkRoundText(e.target.value)}
+                      className="block w-full rounded-md border border-gray-200 px-3 py-2 text-sm"
+                      rows={8}
+                      placeholder="Paste the full round here (questions + answers)."
+                      disabled={isDbBusy || isBulkCreating}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void bulkCreateQuestionsFromText()}
+                      className="inline-flex w-full items-center justify-center rounded-md bg-black px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={isDbBusy || isBulkCreating || !bulkRoundText.trim()}
+                    >
+                      {isBulkCreating ? 'Parsing…' : 'Parse & create questions'}
+                    </button>
+                  </div>
 
                   <div className="mt-6 space-y-3">
                     <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={(e) => void reorderQuestions(e)}>
