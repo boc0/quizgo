@@ -22,12 +22,14 @@ type FreeTextCorrectAnswer = {
 };
 
 type QuizRound = {
+  uid?: string;
   roundNumber: number;
   ruleset: Ruleset;
   pointsPerCorrectAnswer?: number;
   pointsExactMatch?: number;
   pointsClosestWithoutExactMatch?: number;
   questions: Array<{
+    uid?: string;
     number: number;
     text: string;
     options?: string[];
@@ -66,6 +68,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isChoice(value: unknown): value is 'A' | 'B' | 'C' | 'D' {
   return value === 'A' || value === 'B' || value === 'C' || value === 'D';
+}
+
+function makeLocalId(prefix: string) {
+  // Prefer cryptographically-strong ids when available.
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return `${prefix}_${crypto.randomUUID()}`;
+    }
+  } catch {
+    // ignore
+  }
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function SortableRow(props: {
@@ -147,7 +161,8 @@ export default function HomeClient() {
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 5 } }),
+    // Use distance activation for touch so taps still feel responsive.
+    useSensor(TouchSensor, { activationConstraint: { distance: 8 } }),
   );
 
   useEffect(() => {
@@ -475,10 +490,22 @@ export default function HomeClient() {
 
     const roundsRaw = Array.isArray(data?.data?.rounds) ? (data.data.rounds as QuizRound[]) : [];
     const rounds = roundsRaw.map((r) => {
+      const roundUid = typeof (r as QuizRound).uid === 'string' && (r as QuizRound).uid?.trim() ? (r as QuizRound).uid : makeLocalId('round');
+      const questionsRaw = Array.isArray((r as QuizRound).questions) ? (r as QuizRound).questions : [];
+      const questions = questionsRaw.map((q) => {
+        const questionUid =
+          typeof (q as { uid?: unknown }).uid === 'string' && String((q as { uid?: unknown }).uid).trim()
+            ? String((q as { uid?: unknown }).uid)
+            : makeLocalId('question');
+        return { ...q, uid: questionUid };
+      });
+
       const ruleset = (r?.ruleset ?? 'free-text') as Ruleset;
       if (ruleset === 'number') {
         return {
           ...r,
+          uid: roundUid,
+          questions,
           ruleset,
           pointsExactMatch:
             typeof r.pointsExactMatch === 'number' && Number.isFinite(r.pointsExactMatch) ? r.pointsExactMatch : 3,
@@ -491,6 +518,8 @@ export default function HomeClient() {
 
       return {
         ...r,
+        uid: roundUid,
+        questions,
         ruleset,
         pointsPerCorrectAnswer:
           typeof r.pointsPerCorrectAnswer === 'number' && Number.isFinite(r.pointsPerCorrectAnswer)
@@ -631,6 +660,7 @@ export default function HomeClient() {
       rounds: [
         ...activeQuiz.rounds,
         {
+          uid: makeLocalId('round'),
           roundNumber: nextRoundNumber,
           ruleset: 'number',
           pointsExactMatch: 3,
@@ -724,6 +754,7 @@ export default function HomeClient() {
     const newQuestion =
       round.ruleset === 'multiple-choice'
         ? {
+            uid: makeLocalId('question'),
             number: nextQuestionNumber,
             text: '',
             options: ['', '', '', ''],
@@ -731,11 +762,13 @@ export default function HomeClient() {
           }
         : round.ruleset === 'free-text'
           ? {
+              uid: makeLocalId('question'),
               number: nextQuestionNumber,
               text: '',
               correctAnswer: { bg: '', en: '' },
             }
           : {
+              uid: makeLocalId('question'),
               number: nextQuestionNumber,
               text: '',
               correctAnswer: 0,
@@ -795,13 +828,30 @@ export default function HomeClient() {
     if (activeId === overId) return;
 
     const rounds = activeQuiz.rounds;
-    const oldIndex = rounds.findIndex((r) => `round-${r.roundNumber}` === activeId);
-    const newIndex = rounds.findIndex((r) => `round-${r.roundNumber}` === overId);
+    const oldIndex = rounds.findIndex((r) => `round-${r.uid ?? ''}` === activeId);
+    const newIndex = rounds.findIndex((r) => `round-${r.uid ?? ''}` === overId);
     if (oldIndex < 0 || newIndex < 0) return;
 
-    const nextRounds = arrayMove(rounds, oldIndex, newIndex);
+    const movedRounds = arrayMove(rounds, oldIndex, newIndex);
+
+    const renumberMap = new Map<number, number>();
+    const nextRounds = movedRounds.map((r, idx) => {
+      const nextNumber = idx + 1;
+      renumberMap.set(r.roundNumber, nextNumber);
+      return {
+        ...r,
+        roundNumber: nextNumber,
+      };
+    });
+
     const updated: Quiz = { ...activeQuiz, rounds: nextRounds };
     setActiveQuiz(updated);
+
+    if (activeRoundNumber != null) {
+      const nextActive = renumberMap.get(activeRoundNumber);
+      if (typeof nextActive === 'number') setActiveRoundNumber(nextActive);
+    }
+
     await saveQuizToDb(updated);
   };
 
@@ -816,11 +866,22 @@ export default function HomeClient() {
     if (activeId === overId) return;
 
     const questions = round.questions;
-    const oldIndex = questions.findIndex((q) => `question-${q.number}` === activeId);
-    const newIndex = questions.findIndex((q) => `question-${q.number}` === overId);
+    const oldIndex = questions.findIndex((q) => `question-${q.uid ?? ''}` === activeId);
+    const newIndex = questions.findIndex((q) => `question-${q.uid ?? ''}` === overId);
     if (oldIndex < 0 || newIndex < 0) return;
 
-    const nextQuestions = arrayMove(questions, oldIndex, newIndex);
+    const movedQuestions = arrayMove(questions, oldIndex, newIndex);
+
+    const renumberMap = new Map<number, number>();
+    const nextQuestions = movedQuestions.map((q, idx) => {
+      const nextNumber = idx + 1;
+      renumberMap.set(q.number, nextNumber);
+      return {
+        ...q,
+        number: nextNumber,
+      };
+    });
+
     const updated: Quiz = {
       ...activeQuiz,
       rounds: activeQuiz.rounds.map((r) =>
@@ -829,6 +890,12 @@ export default function HomeClient() {
     };
 
     setActiveQuiz(updated);
+
+    if (activeQuestionNumber != null) {
+      const nextActive = renumberMap.get(activeQuestionNumber);
+      if (typeof nextActive === 'number') setActiveQuestionNumber(nextActive);
+    }
+
     await saveQuizToDb(updated);
   };
 
@@ -1430,26 +1497,19 @@ export default function HomeClient() {
                   <div className="mt-6 space-y-3">
                     <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={(e) => void reorderRounds(e)}>
                       <SortableContext
-                        items={activeQuiz.rounds.map((r) => `round-${r.roundNumber}`)}
+                        items={activeQuiz.rounds.map((r) => `round-${r.uid ?? `fallback-${r.roundNumber}`}`)}
                         strategy={verticalListSortingStrategy}
                       >
                         {activeQuiz.rounds.map((r) => (
-                          <SortableRow key={r.roundNumber} id={`round-${r.roundNumber}`} disabled={isDbBusy}>
+                          <SortableRow key={r.uid ?? String(r.roundNumber)} id={`round-${r.uid ?? `fallback-${r.roundNumber}`}`} disabled={isDbBusy}>
                             {({ attributes, listeners }) => (
                               <div className="flex items-stretch gap-2">
                                 <button
                                   type="button"
                                   {...attributes}
                                   {...listeners}
-                                  className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 cursor-grab active:cursor-grabbing"
-                                  disabled={isDbBusy}
-                                >
-                                  Drag
-                                </button>
-                                <button
-                                  type="button"
                                   onClick={() => openRound(r.roundNumber)}
-                                  className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50"
+                                  className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50 cursor-grab active:cursor-grabbing"
                                   disabled={isDbBusy}
                                 >
                                   <div className="text-sm font-medium text-gray-900">Round {r.roundNumber}</div>
@@ -1558,26 +1618,19 @@ export default function HomeClient() {
                   <div className="mt-6 space-y-3">
                     <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={(e) => void reorderQuestions(e)}>
                       <SortableContext
-                        items={(getRound()?.questions ?? []).map((q) => `question-${q.number}`)}
+                        items={(getRound()?.questions ?? []).map((q) => `question-${q.uid ?? `fallback-${q.number}`}`)}
                         strategy={verticalListSortingStrategy}
                       >
                         {(getRound()?.questions ?? []).map((q) => (
-                          <SortableRow key={q.number} id={`question-${q.number}`} disabled={isDbBusy}>
+                          <SortableRow key={q.uid ?? String(q.number)} id={`question-${q.uid ?? `fallback-${q.number}`}`} disabled={isDbBusy}>
                             {({ attributes, listeners }) => (
                               <div className="flex items-stretch gap-2">
                                 <button
                                   type="button"
                                   {...attributes}
                                   {...listeners}
-                                  className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 cursor-grab active:cursor-grabbing"
-                                  disabled={isDbBusy}
-                                >
-                                  Drag
-                                </button>
-                                <button
-                                  type="button"
                                   onClick={() => openQuestion(q.number)}
-                                  className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50"
+                                  className="block w-full rounded-md border border-gray-200 bg-white p-4 text-left hover:bg-gray-50 cursor-grab active:cursor-grabbing"
                                   disabled={isDbBusy}
                                 >
                                   <div className="text-sm font-medium text-gray-900">Question {q.number}</div>
