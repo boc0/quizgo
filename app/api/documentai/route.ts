@@ -6,12 +6,11 @@ export const runtime = 'nodejs';
 function isBlobLike(
   value: unknown,
 ): value is { type?: string; arrayBuffer: () => Promise<ArrayBuffer> } {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'arrayBuffer' in value &&
-    typeof (value as any).arrayBuffer === 'function'
-  );
+  if (typeof value !== 'object' || value === null) return false;
+
+  // Use an indexable record to avoid `any` while still checking a dynamic prop.
+  const record = value as Record<string, unknown>;
+  return typeof record.arrayBuffer === 'function';
 }
 
 export async function POST(req: NextRequest) {

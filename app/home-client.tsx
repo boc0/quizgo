@@ -477,6 +477,82 @@ export default function HomeClient() {
     return parsed;
   };
 
+  const parseDocumentAiRoundNumber = (documentAiJson: unknown): number | null => {
+    const entities =
+      isRecord(documentAiJson) && isRecord(documentAiJson.document) && Array.isArray(documentAiJson.document.entities)
+        ? (documentAiJson.document.entities as unknown[])
+        : [];
+
+    for (const ent of entities) {
+      if (!isRecord(ent)) continue;
+      if (ent.type !== 'round') continue;
+      if (typeof ent.mentionText !== 'string') continue;
+
+      const raw = ent.mentionText.trim();
+      // Expected like "Рунд 3" (single digit 1-9). Be permissive in case of punctuation.
+      const m = raw.match(/\b(\d)\b/);
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n) || n < 1 || n > 9) continue;
+      return n;
+    }
+
+    return null;
+  };
+
+  const parseDocumentAiTeamName = (documentAiJson: unknown): string | null => {
+    const entities =
+      isRecord(documentAiJson) && isRecord(documentAiJson.document) && Array.isArray(documentAiJson.document.entities)
+        ? (documentAiJson.document.entities as unknown[])
+        : [];
+
+    for (const ent of entities) {
+      if (!isRecord(ent)) continue;
+      if (ent.type !== 'team-name') continue;
+      if (typeof ent.mentionText !== 'string') continue;
+
+      const raw = ent.mentionText.trim();
+      // Expected like "Отбор: Some Team".
+      const m = raw.match(/^Отбор\s*:\s*(.+)$/i);
+      const name = (m ? m[1] : raw.replace(/^Отбор\s*/i, '')).trim();
+      if (!name) continue;
+      return name;
+    }
+
+    return null;
+  };
+
+  const pickOrAddTeamFromInference = async (quiz: Quiz, inferredTeamName: string): Promise<{ quiz: Quiz; teamName: string }> => {
+    const inferredNorm = normalizeText(inferredTeamName);
+    if (!inferredNorm) return { quiz, teamName: quiz.teams[0] ?? '' };
+
+    let best: { team: string; score: number } | null = null;
+    for (const t of quiz.teams) {
+      const tNorm = normalizeText(t);
+      if (!tNorm) continue;
+
+      const dist = levenshteinDistance(inferredNorm, tNorm);
+      const denom = Math.max(inferredNorm.length, tNorm.length, 1);
+      const score = dist / denom;
+      if (!best || score < best.score) best = { team: t, score };
+    }
+
+    if (best && best.score <= 0.3) {
+      return { quiz, teamName: best.team };
+    }
+
+    // No good match: register as a new team (avoid duplicates by normalized compare).
+    const alreadyExists = quiz.teams.some((t) => normalizeText(t) === inferredNorm);
+    if (alreadyExists) {
+      const existing = quiz.teams.find((t) => normalizeText(t) === inferredNorm) ?? inferredTeamName;
+      return { quiz, teamName: existing };
+    }
+
+    const updated: Quiz = { ...quiz, teams: [...quiz.teams, inferredTeamName] };
+    await saveQuizToDb(updated);
+    return { quiz: updated, teamName: inferredTeamName };
+  };
+
   const resetSubmitTab = () => {
     setSelectedFile(null);
     setSubmitAnswerDrafts([]);
@@ -1173,19 +1249,21 @@ export default function HomeClient() {
     return new File([blob], outName, { type: mimeType });
   };
 
-  const submitToScanKit = async () => {
-    if (!selectedFile) return;
+  const submitToScanKit = async (file?: File | null) => {
+    const inputFile = file ?? selectedFile;
+    if (!inputFile) return;
 
-    const sourceKey = `${selectedFile.name}:${selectedFile.size}:${selectedFile.lastModified}`;
+    const sourceKey = `${inputFile.name}:${inputFile.size}:${inputFile.lastModified}`;
 
     setIsSubmitting(true);
+    setDbError(null);
     try {
       let pdfBlob = submitPdfBlobRef.current;
 
       // If we've already got the ScanKit PDF for this exact source file,
       // reuse it instead of calling ScanKit again (avoids burning credits).
       if (!(pdfBlob && submitPdfSourceKeyRef.current === sourceKey)) {
-        const resizedFile = await resizeHalf(selectedFile);
+        const resizedFile = await resizeHalf(inputFile);
 
         const form = new FormData();
         form.append('file', resizedFile);
@@ -1248,6 +1326,8 @@ export default function HomeClient() {
       }
 
       const parsed = parseDocumentAiAnswers(docJson);
+      const inferredRound = parseDocumentAiRoundNumber(docJson);
+      const inferredTeamName = parseDocumentAiTeamName(docJson);
       const drafts = Array.from({ length: 10 }, () => '');
       for (const a of parsed) {
         if (a.number >= 1 && a.number <= 10) {
@@ -1255,6 +1335,68 @@ export default function HomeClient() {
         }
       }
       setSubmitAnswerDrafts(drafts);
+
+      // Auto-select the most recent quiz (top of list) if none selected yet.
+      // Then apply the inferred round number if possible.
+      if (!submitSelectedQuizId && quizList.length > 0) {
+        const mostRecentQuizId = quizList[0]?.id ?? '';
+        if (mostRecentQuizId) {
+          setSubmitSelectedQuizId(mostRecentQuizId);
+          setSubmitQuiz(null);
+          setSubmitRoundNumber('');
+          setSubmitTeamName('');
+
+          setIsDbBusy(true);
+          try {
+            let q = await fetchQuiz(mostRecentQuizId);
+
+            if (inferredTeamName) {
+              const teamPick = await pickOrAddTeamFromInference(q, inferredTeamName);
+              q = teamPick.quiz;
+              setSubmitTeamName(teamPick.teamName);
+            } else {
+              const firstTeam = q.teams[0] ?? '';
+              setSubmitTeamName(firstTeam);
+            }
+
+            setSubmitQuiz(q);
+
+            const inferredRoundAvailable =
+              typeof inferredRound === 'number' && q.rounds.some((r) => r.roundNumber === inferredRound);
+
+            const firstRound = q.rounds.slice().sort((a, b) => a.roundNumber - b.roundNumber)[0];
+            setSubmitRoundNumber(inferredRoundAvailable ? inferredRound : firstRound ? firstRound.roundNumber : '');
+          } catch (err) {
+            setDbError(err instanceof Error ? err.message : 'Failed to load quiz.');
+          } finally {
+            setIsDbBusy(false);
+          }
+        }
+      } else if (typeof inferredRound === 'number') {
+        // Quiz already selected; only apply the inferred round if it exists in that quiz.
+        if (!submitQuiz || submitQuiz.rounds.some((r) => r.roundNumber === inferredRound)) {
+          setSubmitRoundNumber(inferredRound);
+        }
+      }
+
+      if (inferredTeamName) {
+        // Quiz already selected (or will be selected by user). If we have the quiz loaded, match/add immediately.
+        if (submitQuiz) {
+          setIsDbBusy(true);
+          try {
+            const teamPick = await pickOrAddTeamFromInference(submitQuiz, inferredTeamName);
+            setSubmitQuiz(teamPick.quiz);
+            setSubmitTeamName(teamPick.teamName);
+          } catch (err) {
+            setDbError(err instanceof Error ? err.message : 'Failed to update team list.');
+          } finally {
+            setIsDbBusy(false);
+          }
+        } else {
+          // No quiz loaded yet: prefill the text so it will be visible after selection.
+          setSubmitTeamName(inferredTeamName);
+        }
+      }
     } catch (error) {
       setDbError(error instanceof Error ? error.message : 'ScanKit request failed.');
     } finally {
@@ -1403,19 +1545,16 @@ export default function HomeClient() {
                         }
 
                         setSelectedFile(next);
+
+                        if (next) {
+                          void submitToScanKit(next);
+                        }
                       }}
                       className="block w-full text-sm text-gray-600 file:mr-4 file:rounded-md file:border-0 file:bg-gray-100 file:px-3 file:py-2 file:text-sm file:font-medium hover:file:bg-gray-200"
                     />
                     <div className="text-xs text-gray-500">{selectedLabel}</div>
 
-                    <button
-                      type="button"
-                      disabled={!selectedFile || isSubmitting}
-                      onClick={submitToScanKit}
-                      className="mt-2 inline-flex w-full items-center justify-center rounded-md bg-black px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {isSubmitting ? 'Reading...' : 'Read answers'}
-                    </button>
+                    {isSubmitting ? <div className="text-xs text-gray-500">Reading…</div> : null}
                   </div>
 
                   {submitPdfUrl ? (
